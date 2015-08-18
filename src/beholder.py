@@ -205,7 +205,7 @@ class Beholder(object):
                         
                     # Check if the current server is the spotted master server
                     if str(host) == str(spotted_server[2]) and str(port) == str(spotted_server[3]) :
-                        self._logger.info('%s is the current master and it is DOWN' % name)
+                        self._logger.info('%s is the current master and it is DOWN' % host)
                         b_checked = True
 
             return b_checked
