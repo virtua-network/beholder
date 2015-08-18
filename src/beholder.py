@@ -97,9 +97,14 @@ class Beholder(object):
         if self._connect():
             while not self._stop_event.is_set():
                 message = self._pubsub.get_message()
-                if message and message['type'] == 'message':
+                if message and message['type'] == 'message' and message['channel'] == '+odown':
+                    # this master is objective down
                     switch_master_info = str(message['data']).split(' ')
-                    self._switch_master(switch_master_info)
+                    self._logger.info('server is spotted DOWN : %s' % switch_master_info[1])
+                    if self._check_master(switch_master_info):
+                        # the master is the legit one, need to search for a failback
+                        masters = self._redis.sentinel_masters() 
+                        self._switch_master(masters, switch_master_info)
                 time.sleep(0.001)
         self._logger.info('Beholder stopped')
         
@@ -109,14 +114,14 @@ class Beholder(object):
         self._stop_event.set()
         
     def _connect(self):
-        """ Connect to Redis sentinel and subscribe to the channel '+switch-master' to listen master changes """
+        """ Connect to Redis sentinel and subscribe to the channel '+odown -odown' to listen masters changes """
         b_connected = False
         retry_count = 0
         while not self._stop_event.is_set() and not b_connected:
             try:
                 self._redis = redis.StrictRedis(host=self._config.redis_sentinel_ip, port=self._config.redis_sentinel_port)
                 self._pubsub = self._redis.pubsub()
-                self._pubsub.subscribe(['+switch-master'])
+                self._pubsub.subscribe(['+odown', '-odown'])
             except:
                 self._logger.exception('Redis sentinel connection error: %s' % retry_count)
                 # Check if maximum retry count is arrived
@@ -130,8 +135,35 @@ class Beholder(object):
                 b_connected = True
             
         return b_connected
-                
-    def _switch_master(self, switch_master_info):
+
+    def _switch_master(self, masters, switch_master_info):
+        """ Called when identified master is the used one. """
+	# extract the other master's name
+        for key in masters.keys():
+            if key not in switch_master_info[1]:
+                new_name = key
+        # compute all parameters
+        if len(switch_master_info) > 5:
+            old_name = switch_master_info[1]
+            old_ip = switch_master_info[2]
+            old_port = switch_master_info[3]
+            new_ip = masters[new_name]['ip']
+            new_port = masters[new_name]['port']
+            # switching occurs only on valid masters
+            if not masters[new_name]['is_odown']: 
+                if self._update_masters(old_ip, old_port, new_ip, new_port, new_name):
+                    self._restart_twemproxy()
+                    self._logger.info('Master changed successfully')
+                else:
+                    err = 'Master update error %s (%s:%s --> %s:%s)' % (new_name, old_ip, old_port, new_ip, new_port)
+                    self._logger.error(err)
+            else:
+                err = 'All masters are dead.. switching cancelled'
+                self._logger.error(err)
+        else:
+            self._logger.warning('Wrong number of parameters: %s' % switch_master_info)
+
+    def _switch_master_slave(self, switch_master_info):
         """ Called when new message is publish in the sentinel channel (+switch-master) """
         if len(switch_master_info) > 3:
             old_ip = switch_master_info[1]
@@ -147,10 +179,41 @@ class Beholder(object):
         else:
             self._logger.warning('Wrong number of parameters: %s' % switch_master_info)
 
-    def _update_masters(self, old_server, old_port, new_server, new_port):
+    def _check_master(self, spotted_server):
+        """ Check who is the current master server in the twemproxy config """
+        b_checked = False
+        try:
+            with open(self._config.twemproxy_config_file) as f:
+                proxy_data = yaml.safe_load(f)
+        except:
+            self._logger.exception('Could not open the twemproxy configuration file')
+        else:
+            for proxy in proxy_data:
+                for i, server in enumerate(proxy_data[proxy]['servers']):
+                    server_data = server.split(' ')
+                    url_data = server_data[0].split(':')
+                    
+                    host = url_data[0]
+                    port = url_data[1]
+                    number = url_data[2]
+                    name = ''
+                    
+                    try:
+                        name = server_data[1]
+                    except:
+                        pass
+                        
+                    # Check if the current server is the spotted master server
+                    if str(host) == str(spotted_server[2]) and str(port) == str(spotted_server[3]) :
+                        self._logger.info('%s is the current master and it is DOWN' % name)
+                        b_checked = True
+
+            return b_checked
+
+    def _update_masters(self, old_server, old_port, new_server, new_port, new_name):
         """ Updates the address of a server in the twemproxy config """
+
         b_updated = False
-        
         try:
             with open(self._config.twemproxy_config_file) as f:
                 proxy_data = yaml.safe_load(f)
@@ -176,8 +239,9 @@ class Beholder(object):
                     if str(host) == str(old_server) and str(port) == str(old_port):
                         host = new_server
                         port = new_port
+                        name = new_name
                         proxy_data[proxy]['servers'][i]= host + ':' + str(port) + ':' + str(number) + ' ' + name
-                        self._logger.info('%s -> %s:%s changed to %s:%s' % (name, old_server, old_port, host, port))
+                        self._logger.info('selected master : %s -> %s:%s' % (name, host, port))
                         b_updated = True
 
             try:
